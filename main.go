@@ -53,8 +53,22 @@ var configCmd = &discordgo.ApplicationCommand{
 				{
 					Type:        discordgo.ApplicationCommandOptionString,
 					Name:        "value",
-					Description: "e.g. \"ticket\" creates channels like ticket-123456",
+					Description: "e.g. \"ticket\" creates channels like ticket-1, ticket-2, ...",
 					Required:    true,
+				},
+			},
+		},
+		{
+			Type:        discordgo.ApplicationCommandOptionSubCommand,
+			Name:        "category",
+			Description: "Set which category ticket channels go in",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:         discordgo.ApplicationCommandOptionChannel,
+					Name:         "category",
+					Description:  "Category for ticket channels",
+					ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildCategory},
+					Required:     true,
 				},
 			},
 		},
@@ -67,16 +81,18 @@ var configCmd = &discordgo.ApplicationCommand{
 }
 
 type panelConfig struct {
-	ChannelID string
-	RoleID    string
-	Prefix    string
+	ChannelID  string
+	RoleID     string
+	Prefix     string
+	CategoryID string // empty means "use the panel channel's own category"
+	NextTicket int    // counts up: ticket-1, ticket-2, ...
 }
 
-// configs is saved to disk; awaitingText isn't (it only lives a few seconds).
+// configs is saved to disk; awaitingText isn't.
 var (
 	stateMu sync.Mutex
 
-	configs      = map[string]panelConfig{} // guildID -> current channel/role/prefix
+	configs      = map[string]panelConfig{} // guildID -> current config
 	awaitingText = map[string]string{}      // userID -> guildID they're sending panel text for
 )
 
@@ -98,8 +114,8 @@ func getConfig(guildID string) panelConfig {
 	return configs[guildID]
 }
 
-// Applies one field change to a guild's config and saves it to disk.
-func setConfig(guildID string, mutate func(*panelConfig)) {
+// Applies one change to a guild's config, saves it, and returns the result.
+func setConfig(guildID string, mutate func(*panelConfig)) panelConfig {
 	stateMu.Lock()
 	cfg := configs[guildID]
 	mutate(&cfg)
@@ -108,20 +124,21 @@ func setConfig(guildID string, mutate func(*panelConfig)) {
 	stateMu.Unlock()
 	if err != nil {
 		log.Println("Failed to marshal configs:", err)
-		return
+		return cfg
 	}
 	if err := os.WriteFile(configsPath, data, 0600); err != nil {
 		log.Println("Failed to save configs:", err)
 	}
+	return cfg
 }
 
 // Checks that a message is really one the bot sent, so we can trust it.
-func fetchOwnEmbed(s *discordgo.Session, channelID, messageID string) (*discordgo.MessageEmbed, bool) {
+func fetchOwnMessage(s *discordgo.Session, channelID, messageID string) (*discordgo.Message, bool) {
 	msg, err := s.ChannelMessage(channelID, messageID)
-	if err != nil || len(msg.Embeds) == 0 || msg.Author.ID != s.State.User.ID {
+	if err != nil || msg.Author.ID != s.State.User.ID {
 		return nil, false
 	}
-	return msg.Embeds[0], true
+	return msg, true
 }
 
 func main() {
@@ -166,12 +183,11 @@ func reply(s *discordgo.Session, i *discordgo.InteractionCreate, content string)
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: content,
-			Flags:   discordgo.MessageFlagsEphemeral,
 		},
 	})
 }
 
-// Handles each /config option (channel, role, prefix, message).
+// Handles each /config subcommand.
 func handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
 	if data.Name != "config" || len(data.Options) == 0 {
@@ -194,6 +210,11 @@ func handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		prefix := sub.Options[0].StringValue()
 		setConfig(i.GuildID, func(c *panelConfig) { c.Prefix = prefix })
 		reply(s, i, fmt.Sprintf("Channel prefix set to %q.", prefix))
+
+	case "category":
+		categoryID := sub.Options[0].ChannelValue(nil).ID
+		setConfig(i.GuildID, func(c *panelConfig) { c.CategoryID = categoryID })
+		reply(s, i, fmt.Sprintf("Ticket category set to <#%s>.", categoryID))
 
 	case "message":
 		cfg := getConfig(i.GuildID)
@@ -226,14 +247,9 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 	cfg := getConfig(guildID)
 
-	confirmMsg, err := s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
-		Content:   fmt.Sprintf("React ✅ to confirm deploying this panel to <#%s>, or ❌ to redo the message.", cfg.ChannelID),
-		Reference: m.Reference(),
-		Embed: &discordgo.MessageEmbed{
-			Description: m.Content,
-			Color:       0x2b2d31,
-		},
-	})
+	confirmMsg, err := s.ChannelMessageSendReply(m.ChannelID,
+		fmt.Sprintf("React ✅ to confirm deploying this panel to <#%s>, or ❌ to redo the message.", cfg.ChannelID),
+		m.Reference())
 	if err != nil {
 		return
 	}
@@ -258,8 +274,12 @@ func handleReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 
 // Posts the panel once someone reacts with ✅ to confirm it.
 func handleConfirmReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-	srcEmbed, ok := fetchOwnEmbed(s, r.ChannelID, r.MessageID)
-	if !ok {
+	msg, ok := fetchOwnMessage(s, r.ChannelID, r.MessageID)
+	if !ok || msg.MessageReference == nil {
+		return
+	}
+	orig, err := s.ChannelMessage(msg.MessageReference.ChannelID, msg.MessageReference.MessageID)
+	if err != nil {
 		return
 	}
 
@@ -268,12 +288,7 @@ func handleConfirmReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd
 		return
 	}
 
-	embed := &discordgo.MessageEmbed{
-		Description: srcEmbed.Description,
-		Color:       0x2b2d31,
-	}
-
-	panelMsg, err := s.ChannelMessageSendEmbed(cfg.ChannelID, embed)
+	panelMsg, err := s.ChannelMessageSend(cfg.ChannelID, orig.Content)
 	if err != nil {
 		return
 	}
@@ -282,7 +297,7 @@ func handleConfirmReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd
 
 // Lets the admin type the panel message again if they don't like it.
 func handleRedoReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-	if _, ok := fetchOwnEmbed(s, r.ChannelID, r.MessageID); !ok {
+	if _, ok := fetchOwnMessage(s, r.ChannelID, r.MessageID); !ok {
 		return
 	}
 
@@ -294,9 +309,21 @@ func handleRedoReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 	s.ChannelMessageSendReply(r.ChannelID, "Send the new panel message.", ref)
 }
 
+// Falls back to the panel channel's own category if none is set.
+func ticketCategory(s *discordgo.Session, cfg panelConfig) string {
+	if cfg.CategoryID != "" {
+		return cfg.CategoryID
+	}
+	ch, err := s.Channel(cfg.ChannelID)
+	if err != nil {
+		return ""
+	}
+	return ch.ParentID
+}
+
 // Makes a private ticket channel when someone reacts to the panel.
 func handleTicketReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-	if _, ok := fetchOwnEmbed(s, r.ChannelID, r.MessageID); !ok {
+	if _, ok := fetchOwnMessage(s, r.ChannelID, r.MessageID); !ok {
 		return
 	}
 
@@ -307,21 +334,13 @@ func handleTicketReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd)
 
 	s.MessageReactionRemove(r.ChannelID, r.MessageID, r.Emoji.Name, r.UserID)
 
-	channelName := fmt.Sprintf("%s-%s", cfg.Prefix, r.UserID)
+	cfg = setConfig(r.GuildID, func(c *panelConfig) { c.NextTicket++ })
+	channelName := fmt.Sprintf("%s-%d", cfg.Prefix, cfg.NextTicket)
 
-	channels, err := s.GuildChannels(r.GuildID)
-	if err != nil {
-		return
-	}
-	for _, c := range channels {
-		if c.Name == channelName {
-			return
-		}
-	}
-
-	_, err = s.GuildChannelCreateComplex(r.GuildID, discordgo.GuildChannelCreateData{
-		Name: channelName,
-		Type: discordgo.ChannelTypeGuildText,
+	s.GuildChannelCreateComplex(r.GuildID, discordgo.GuildChannelCreateData{
+		Name:     channelName,
+		Type:     discordgo.ChannelTypeGuildText,
+		ParentID: ticketCategory(s, cfg),
 		PermissionOverwrites: []*discordgo.PermissionOverwrite{
 			{
 				ID:   r.GuildID,

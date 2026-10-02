@@ -2,7 +2,7 @@ FROM golang:1.26.7-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go .
+COPY *.go .
 RUN CGO_ENABLED=0 go build -o bot .
 
 FROM alpine:latest

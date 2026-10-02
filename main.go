@@ -11,7 +11,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-// Max time without a heartbeat ack before we consider the gateway connection dead.
+// Max time without a heartbeat ack before the gateway connection is dead.
 const heartbeatStaleAfter = 90 * time.Second
 
 func main() {

@@ -323,7 +323,8 @@ func ticketCategory(s *discordgo.Session, cfg panelConfig) string {
 
 // Makes a private ticket channel when someone reacts to the panel.
 func handleTicketReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-	if _, ok := fetchOwnMessage(s, r.ChannelID, r.MessageID); !ok {
+	panelMsg, ok := fetchOwnMessage(s, r.ChannelID, r.MessageID)
+	if !ok {
 		return
 	}
 
@@ -337,7 +338,7 @@ func handleTicketReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd)
 	cfg = setConfig(r.GuildID, func(c *panelConfig) { c.NextTicket++ })
 	channelName := fmt.Sprintf("%s-%d", cfg.Prefix, cfg.NextTicket)
 
-	s.GuildChannelCreateComplex(r.GuildID, discordgo.GuildChannelCreateData{
+	ch, err := s.GuildChannelCreateComplex(r.GuildID, discordgo.GuildChannelCreateData{
 		Name:     channelName,
 		Type:     discordgo.ChannelTypeGuildText,
 		ParentID: ticketCategory(s, cfg),
@@ -359,4 +360,8 @@ func handleTicketReaction(s *discordgo.Session, r *discordgo.MessageReactionAdd)
 			},
 		},
 	})
+	if err != nil {
+		return
+	}
+	s.ChannelMessageSend(ch.ID, panelMsg.Content)
 }

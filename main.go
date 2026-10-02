@@ -120,12 +120,8 @@ func setConfig(guildID string, mutate func(*panelConfig)) panelConfig {
 	cfg := configs[guildID]
 	mutate(&cfg)
 	configs[guildID] = cfg
-	data, err := json.Marshal(configs)
+	data, _ := json.Marshal(configs)
 	stateMu.Unlock()
-	if err != nil {
-		log.Println("Failed to marshal configs:", err)
-		return cfg
-	}
 	if err := os.WriteFile(configsPath, data, 0600); err != nil {
 		log.Println("Failed to save configs:", err)
 	}
@@ -173,7 +169,7 @@ func main() {
 	}
 
 	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
 	<-sc
 	dg.Close()
 }
@@ -194,27 +190,31 @@ func handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 	sub := data.Options[0]
+	var opt *discordgo.ApplicationCommandInteractionDataOption
+	if len(sub.Options) > 0 {
+		opt = sub.Options[0]
+	}
 
 	switch sub.Name {
 	case "channel":
-		channelID := sub.Options[0].ChannelValue(nil).ID
-		setConfig(i.GuildID, func(c *panelConfig) { c.ChannelID = channelID })
-		reply(s, i, fmt.Sprintf("Support channel set to <#%s>.", channelID))
+		id := opt.ChannelValue(nil).ID
+		setConfig(i.GuildID, func(c *panelConfig) { c.ChannelID = id })
+		reply(s, i, fmt.Sprintf("Support channel set to <#%s>.", id))
 
 	case "role":
-		roleID := sub.Options[0].RoleValue(nil, "").ID
-		setConfig(i.GuildID, func(c *panelConfig) { c.RoleID = roleID })
-		reply(s, i, fmt.Sprintf("Reader role set to <@&%s>.", roleID))
+		id := opt.RoleValue(nil, "").ID
+		setConfig(i.GuildID, func(c *panelConfig) { c.RoleID = id })
+		reply(s, i, fmt.Sprintf("Reader role set to <@&%s>.", id))
 
 	case "prefix":
-		prefix := sub.Options[0].StringValue()
-		setConfig(i.GuildID, func(c *panelConfig) { c.Prefix = prefix })
-		reply(s, i, fmt.Sprintf("Channel prefix set to %q.", prefix))
+		v := opt.StringValue()
+		setConfig(i.GuildID, func(c *panelConfig) { c.Prefix = v })
+		reply(s, i, fmt.Sprintf("Channel prefix set to %q.", v))
 
 	case "category":
-		categoryID := sub.Options[0].ChannelValue(nil).ID
-		setConfig(i.GuildID, func(c *panelConfig) { c.CategoryID = categoryID })
-		reply(s, i, fmt.Sprintf("Ticket category set to <#%s>.", categoryID))
+		id := opt.ChannelValue(nil).ID
+		setConfig(i.GuildID, func(c *panelConfig) { c.CategoryID = id })
+		reply(s, i, fmt.Sprintf("Ticket category set to <#%s>.", id))
 
 	case "message":
 		cfg := getConfig(i.GuildID)
@@ -242,7 +242,7 @@ func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 		delete(awaitingText, m.Author.ID)
 	}
 	stateMu.Unlock()
-	if !ok {
+	if !ok || guildID != m.GuildID {
 		return
 	}
 	cfg := getConfig(guildID)

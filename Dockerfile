@@ -6,7 +6,7 @@ COPY main.go .
 RUN CGO_ENABLED=0 go build -o bot .
 
 FROM alpine:latest
-WORKDIR /root/
+WORKDIR /app
 RUN apk --no-cache add ca-certificates
 COPY --from=builder /app/bot .
 CMD ["./bot"]
